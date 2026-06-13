@@ -2,7 +2,11 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 
-const DB_DIR = path.join(process.cwd(), 'data');
+// On Vercel the project root is read-only; use /tmp instead.
+const DB_DIR = process.env.VERCEL === '1'
+  ? '/tmp/file-shrinker/data'
+  : path.join(process.cwd(), 'data');
+
 const DB_PATH = path.join(DB_DIR, 'file-shrinker.db');
 
 let db: Database.Database | null = null;

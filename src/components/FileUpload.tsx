@@ -55,21 +55,52 @@ export default function FileUpload({ onUploadComplete }: FileUploadProps) {
       xhr.send(formData);
       await progressPromise;
 
-      const response = JSON.parse(xhr.responseText);
+      // XHR status 0 means the request never got a response (connection refused,
+      // CORS block, or the server closed the connection without a reply).
+      if (xhr.status === 0) {
+        const detail = file.size > 4.5 * 1024 * 1024
+          ? `No response from server. File size is ${(file.size / 1024 / 1024).toFixed(1)} MB — your hosting plan may have a smaller upload limit.`
+          : 'No response from server. Check your network connection or server logs.';
+        setUploads(prev =>
+          prev.map(u => u.file === file ? { ...u, status: 'error', error: detail } : u)
+        );
+        return;
+      }
+
+      let response: { success?: boolean; error?: string; detail?: string } = {};
+      try {
+        response = JSON.parse(xhr.responseText);
+      } catch {
+        // Response body wasn't valid JSON — show the raw text (truncated)
+        const rawPreview = xhr.responseText.slice(0, 200);
+        setUploads(prev =>
+          prev.map(u => u.file === file
+            ? { ...u, status: 'error', error: `Server returned HTTP ${xhr.status} with non-JSON body: ${rawPreview}` }
+            : u)
+        );
+        return;
+      }
 
       if (xhr.status >= 200 && xhr.status < 300 && response.success) {
         setUploads(prev =>
-          prev.map(u => u.file === file ? { ...u, progress: 100, status: 'done', result: response.file } : u)
+          prev.map(u => u.file === file ? { ...u, progress: 100, status: 'done', result: (response as { file?: import('@/types').FileRecord }).file } : u)
         );
-        onUploadComplete(response.file);
+        onUploadComplete((response as { file: import('@/types').FileRecord }).file);
       } else {
+        // Show both the short error and the server detail if present
+        const msg = [
+          `HTTP ${xhr.status}:`,
+          response.error ?? 'Upload failed',
+          response.detail ? `(${response.detail})` : '',
+        ].filter(Boolean).join(' ');
         setUploads(prev =>
-          prev.map(u => u.file === file ? { ...u, status: 'error', error: response.error ?? 'Upload failed' } : u)
+          prev.map(u => u.file === file ? { ...u, status: 'error', error: msg } : u)
         );
       }
-    } catch {
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       setUploads(prev =>
-        prev.map(u => u.file === file ? { ...u, status: 'error', error: 'Network error' } : u)
+        prev.map(u => u.file === file ? { ...u, status: 'error', error: `Client error: ${msg}` } : u)
       );
     }
   }, [onUploadComplete]);

@@ -1,9 +1,14 @@
 import path from 'path';
 import fs from 'fs';
 
-const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
-export const ORIGINALS_DIR = path.join(UPLOADS_DIR, 'originals');
-export const OPTIMIZED_DIR = path.join(UPLOADS_DIR, 'optimized');
+// On Vercel the project root is read-only; /tmp is the only writable location.
+// VERCEL env var is set to "1" automatically in all Vercel deployments.
+const BASE_DIR = process.env.VERCEL === '1'
+  ? '/tmp/file-shrinker'
+  : path.join(process.cwd(), 'uploads');
+
+export const ORIGINALS_DIR = path.join(BASE_DIR, 'originals');
+export const OPTIMIZED_DIR = path.join(BASE_DIR, 'optimized');
 
 export function ensureStorageDirs(): void {
   fs.mkdirSync(ORIGINALS_DIR, { recursive: true });
@@ -96,7 +101,6 @@ export const ALREADY_COMPRESSED_MIME_TYPES = new Set([
   'application/zip',
   'application/x-zip-compressed',
   'application/gzip',
-  'application/x-gzip',
   'application/x-bzip2',
   'application/x-7z-compressed',
   'application/x-rar-compressed',

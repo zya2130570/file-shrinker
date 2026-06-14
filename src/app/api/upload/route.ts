@@ -45,15 +45,19 @@ export async function POST(request: NextRequest) {
     return err(`File too large (${Math.round(file.size / 1024 / 1024)} MB)`, 'Maximum is 500 MB', 400);
   }
 
-  // 3. Read bytes
+  // 3. Read bytes — keep as ArrayBuffer so we can pass Uint8Array to Supabase Storage.
+  // Node.js Buffer passed directly to the fetch-based Supabase client gets coerced
+  // to a string via toString(), corrupting every byte > 127.
+  let arrayBuffer: ArrayBuffer;
   let buffer: Buffer;
   try {
-    buffer = Buffer.from(await file.arrayBuffer());
+    arrayBuffer = await file.arrayBuffer();
+    buffer = Buffer.from(arrayBuffer);
   } catch (e) {
     return err('Failed to read file data', e instanceof Error ? e.message : String(e), 400);
   }
 
-  // 4. Upload original to Supabase Storage
+  // 4. Upload original to Supabase Storage (Uint8Array keeps binary intact)
   const uuid = uuidv4();
   const ext = mimeToExt(file.type);
   const originalStoragePath = `${uuid}${ext}`;
@@ -61,7 +65,7 @@ export async function POST(request: NextRequest) {
 
   const { error: uploadError } = await supabase.storage
     .from(ORIGINALS_BUCKET)
-    .upload(originalStoragePath, buffer, { contentType: file.type, upsert: false });
+    .upload(originalStoragePath, new Uint8Array(arrayBuffer), { contentType: file.type, upsert: false });
 
   if (uploadError) {
     return err(
@@ -92,7 +96,7 @@ export async function POST(request: NextRequest) {
 
     const { error: optUploadError } = await supabase.storage
       .from(OPTIMIZED_BUCKET)
-      .upload(optimizedStoragePath, optResult.optimizedBuffer, { contentType: optMime, upsert: false });
+      .upload(optimizedStoragePath, new Uint8Array(optResult.optimizedBuffer), { contentType: optMime, upsert: false });
 
     if (optUploadError) {
       console.error('Optimized upload failed:', optUploadError.message);

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
-import { mimeToExt } from '@/lib/storage';
+import { supabase } from '@/lib/supabase';
+import { ORIGINALS_BUCKET, mimeToExt } from '@/lib/storage';
 
 const MAX_FILE_SIZE = 500 * 1024 * 1024;
 
@@ -15,8 +16,9 @@ const ALLOWED_MIME_TYPES = new Set([
   'application/zip', 'application/x-zip-compressed', 'application/gzip', 'application/x-7z-compressed',
 ]);
 
-// Step 1 of 3: validate the file and return everything the client needs to upload
-// directly to Supabase Storage — no file bytes ever touch this Vercel function.
+// Step 1 of 3: validate the file and return a Supabase-signed upload URL.
+// The token is embedded in the URL query string — the client sends NO
+// Authorization header, avoiding the XHR ISO-8859-1 header restriction entirely.
 export async function POST(request: NextRequest) {
   let body: { filename?: string; mimeType?: string; size?: number };
   try {
@@ -45,25 +47,24 @@ export async function POST(request: NextRequest) {
   const storagePath = `${uuid}${ext}`;
   const originalFilename = path.basename(filename).replace(/[^\w.\- ]/g, '_').slice(0, 255);
 
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const anonKey = process.env.SUPABASE_ANON_KEY;
+  // Generate a signed upload URL (valid for 2 hours).
+  // Token is in the URL — client only needs Content-Type header, no Authorization.
+  const { data: signed, error: signErr } = await supabase.storage
+    .from(ORIGINALS_BUCKET)
+    .createSignedUploadUrl(storagePath);
 
-  if (!supabaseUrl || !anonKey) {
+  if (signErr || !signed?.signedUrl) {
     return NextResponse.json(
-      { error: 'Server misconfigured: missing SUPABASE_URL or SUPABASE_ANON_KEY' },
+      { error: 'Failed to create upload URL', detail: signErr?.message ?? 'No signed URL returned' },
       { status: 500 }
     );
   }
 
-  // Return the direct Supabase Storage upload endpoint + auth so the browser can
-  // POST the file bytes straight there, bypassing Vercel's 4.5 MB function limit.
   return NextResponse.json({
     uuid,
     storagePath,
     originalFilename,
-    // Browser will POST to this URL with the raw file as the body
-    uploadUrl: `${supabaseUrl}/storage/v1/object/fsa-originals/${storagePath}`,
-    // Anon key is intentionally public in Supabase's security model
-    uploadToken: anonKey,
+    // Client PUTs the file directly to this URL — no auth header needed
+    uploadUrl: signed.signedUrl,
   });
 }

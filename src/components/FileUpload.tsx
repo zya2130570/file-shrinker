@@ -52,9 +52,8 @@ export default function FileUpload({ onUploadComplete }: FileUploadProps) {
         set({ status: 'error', error: `HTTP ${prepRes.status}: ${prep.error ?? 'Prepare failed'}` });
         return;
       }
-      const { uuid, storagePath, originalFilename, uploadUrl, uploadToken } = prep as {
-        uuid: string; storagePath: string; originalFilename: string;
-        uploadUrl: string; uploadToken: string;
+      const { uuid, storagePath, originalFilename, uploadUrl } = prep as {
+        uuid: string; storagePath: string; originalFilename: string; uploadUrl: string;
       };
 
       // ── Step 2: Upload file DIRECTLY to Supabase Storage via XHR ─────────────
@@ -78,10 +77,10 @@ export default function FileUpload({ onUploadComplete }: FileUploadProps) {
         });
         xhr.addEventListener('error', () => reject(new Error('Network error during upload to storage')));
 
-        xhr.open('POST', uploadUrl);
-        xhr.setRequestHeader('Authorization', `Bearer ${uploadToken}`);
+        // Signed URL has the token in the query string — no Authorization header
+        // needed, which avoids XHR's ISO-8859-1 restriction on header values.
+        xhr.open('PUT', uploadUrl);
         xhr.setRequestHeader('Content-Type', file.type);
-        xhr.setRequestHeader('x-upsert', 'false');
         xhr.send(file); // Native File/Blob — binary-safe
       });
 

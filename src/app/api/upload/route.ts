@@ -1,182 +1,135 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
-import fs from 'fs';
-import { getDb } from '@/lib/db';
-import { ORIGINALS_DIR, ensureStorageDirs, mimeToExt } from '@/lib/storage';
-import { processFile } from '@/lib/processors';
+import { supabase } from '@/lib/supabase';
+import { ORIGINALS_BUCKET, OPTIMIZED_BUCKET, mimeToExt } from '@/lib/storage';
+import { processBuffer } from '@/lib/processors';
 
-const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
+const MAX_FILE_SIZE = 500 * 1024 * 1024;
 
 const ALLOWED_MIME_TYPES = new Set([
-  // Images
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml',
-  'image/tiff', 'image/bmp',
-  // PDF
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml', 'image/tiff', 'image/bmp',
   'application/pdf',
-  // Audio
   'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/flac', 'audio/aac',
-  // Video
   'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime', 'video/x-msvideo',
-  // Text
   'text/plain', 'text/csv', 'application/json', 'application/csv',
-  'text/html', 'text/xml', 'application/xml', 'text/javascript',
-  'application/javascript', 'text/css',
-  // Generic compressed (store only)
-  'application/zip', 'application/x-zip-compressed', 'application/gzip',
-  'application/x-7z-compressed',
+  'text/html', 'text/xml', 'application/xml', 'text/javascript', 'application/javascript', 'text/css',
+  'application/zip', 'application/x-zip-compressed', 'application/gzip', 'application/x-7z-compressed',
 ]);
 
-function errorResponse(message: string, detail: string, status: number) {
+function err(message: string, detail: string, status: number) {
   return NextResponse.json({ success: false, error: message, detail }, { status });
 }
 
 export async function POST(request: NextRequest) {
-  let uuid: string | null = null;
-  let originalPath: string | null = null;
-
+  // 1. Parse form
+  let formData: FormData;
   try {
-    // Step 1: Ensure storage directories exist
-    try {
-      ensureStorageDirs();
-    } catch (err) {
-      return errorResponse(
-        'Storage initialization failed',
-        `Could not create upload directories: ${err instanceof Error ? err.message : String(err)}`,
-        500
-      );
-    }
+    formData = await request.formData();
+  } catch (e) {
+    return err('Failed to parse upload', e instanceof Error ? e.message : String(e), 400);
+  }
 
-    // Step 2: Parse the multipart form
-    let formData: FormData;
-    try {
-      formData = await request.formData();
-    } catch (err) {
-      return errorResponse(
-        'Failed to parse upload',
-        `Request body could not be read: ${err instanceof Error ? err.message : String(err)}`,
-        400
-      );
-    }
+  const file = formData.get('file') as File | null;
+  if (!file) return err('No file provided', 'The "file" field is missing from the form data', 400);
 
-    const file = formData.get('file') as File | null;
-    if (!file) {
-      return errorResponse('No file provided', 'The "file" field is missing from the form data', 400);
-    }
-
-    // Step 3: Validate
-    if (!ALLOWED_MIME_TYPES.has(file.type)) {
-      return errorResponse(
-        `Unsupported file type: ${file.type || '(unknown)'}`,
-        'Supported types: images, PDFs, audio, video, text, CSV, JSON, ZIP',
-        400
-      );
-    }
-
-    if (file.size > MAX_FILE_SIZE) {
-      return errorResponse(
-        `File too large (${Math.round(file.size / 1024 / 1024)} MB)`,
-        'Maximum upload size is 500 MB',
-        400
-      );
-    }
-
-    // Step 4: Write original file to disk
-    const originalFilename = path.basename(file.name).replace(/[^\w.\- ]/g, '_').slice(0, 255);
-    uuid = uuidv4();
-    const ext = mimeToExt(file.type);
-    originalPath = path.join(ORIGINALS_DIR, `${uuid}${ext}`);
-
-    let arrayBuffer: ArrayBuffer;
-    try {
-      arrayBuffer = await file.arrayBuffer();
-    } catch (err) {
-      return errorResponse(
-        'Failed to read file data',
-        err instanceof Error ? err.message : String(err),
-        400
-      );
-    }
-
-    try {
-      fs.writeFileSync(originalPath, Buffer.from(arrayBuffer));
-    } catch (err) {
-      return errorResponse(
-        'Failed to save file',
-        `Disk write error: ${err instanceof Error ? err.message : String(err)}`,
-        500
-      );
-    }
-
-    // Step 5: Initialize DB and insert record
-    let db: ReturnType<typeof getDb>;
-    try {
-      db = getDb();
-    } catch (err) {
-      // Clean up file if DB fails
-      try { fs.unlinkSync(originalPath); } catch {}
-      return errorResponse(
-        'Database initialization failed',
-        err instanceof Error ? err.message : String(err),
-        500
-      );
-    }
-
-    const now = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO files (id, original_filename, mime_type, original_size, upload_date, original_path, optimization_status)
-      VALUES (?, ?, ?, ?, ?, ?, 'processing')
-    `).run(uuid, originalFilename, file.type, file.size, now, originalPath);
-
-    // Step 6: Run optimization synchronously so it completes before the
-    // serverless function returns (setImmediate is killed after response on Vercel).
-    let optResult;
-    try {
-      optResult = await processFile(originalPath, uuid, file.type, file.size);
-    } catch (err) {
-      optResult = {
-        optimizedPath: null,
-        optimizedSize: null,
-        compressionMethod: null,
-        status: 'failed' as const,
-      };
-      console.error('Optimization error:', err);
-    }
-
-    db.prepare(`
-      UPDATE files SET
-        optimized_size = ?,
-        compression_method = ?,
-        optimized_path = ?,
-        optimization_status = ?
-      WHERE id = ?
-    `).run(
-      optResult.optimizedSize,
-      optResult.compressionMethod,
-      optResult.optimizedPath,
-      optResult.status,
-      uuid
-    );
-
-    const record = db.prepare('SELECT * FROM files WHERE id = ?').get(uuid);
-    return NextResponse.json({ success: true, file: record }, { status: 201 });
-
-  } catch (err) {
-    // Last-resort catch — log and return the real message
-    const message = err instanceof Error ? err.message : String(err);
-    const stack = err instanceof Error ? err.stack : undefined;
-    console.error('Unhandled upload error:', stack ?? message);
-
-    // Clean up partial file if it was written
-    if (originalPath) {
-      try { fs.unlinkSync(originalPath); } catch {}
-    }
-
-    return NextResponse.json(
-      { success: false, error: 'Upload failed', detail: message },
-      { status: 500 }
+  // 2. Validate
+  if (!ALLOWED_MIME_TYPES.has(file.type)) {
+    return err(
+      `Unsupported file type: ${file.type || '(unknown)'}`,
+      'Supported: images, PDFs, audio, video, text, CSV, JSON, ZIP',
+      400
     );
   }
+  if (file.size > MAX_FILE_SIZE) {
+    return err(`File too large (${Math.round(file.size / 1024 / 1024)} MB)`, 'Maximum is 500 MB', 400);
+  }
+
+  // 3. Read bytes
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(await file.arrayBuffer());
+  } catch (e) {
+    return err('Failed to read file data', e instanceof Error ? e.message : String(e), 400);
+  }
+
+  // 4. Upload original to Supabase Storage
+  const uuid = uuidv4();
+  const ext = mimeToExt(file.type);
+  const originalStoragePath = `${uuid}${ext}`;
+  const originalFilename = path.basename(file.name).replace(/[^\w.\- ]/g, '_').slice(0, 255);
+
+  const { error: uploadError } = await supabase.storage
+    .from(ORIGINALS_BUCKET)
+    .upload(originalStoragePath, buffer, { contentType: file.type, upsert: false });
+
+  if (uploadError) {
+    return err(
+      'Failed to store file',
+      `Supabase Storage error: ${uploadError.message}`,
+      500
+    );
+  }
+
+  // 5. Optimize in memory
+  let optResult;
+  try {
+    optResult = await processBuffer(buffer, file.type);
+  } catch (e) {
+    optResult = { optimizedBuffer: null, optimizedExt: null, compressionMethod: null, status: 'failed' as const };
+    console.error('Optimization error:', e);
+  }
+
+  // 6. Upload optimized if we have one
+  let optimizedStoragePath: string | null = null;
+  let optimizedSize: number | null = null;
+
+  if (optResult.optimizedBuffer && optResult.optimizedExt) {
+    optimizedStoragePath = `${uuid}${optResult.optimizedExt}`;
+    const optMime = optResult.optimizedExt === '.gz' ? 'application/gzip'
+      : optResult.optimizedExt === '.webp' ? 'image/webp'
+      : file.type;
+
+    const { error: optUploadError } = await supabase.storage
+      .from(OPTIMIZED_BUCKET)
+      .upload(optimizedStoragePath, optResult.optimizedBuffer, { contentType: optMime, upsert: false });
+
+    if (optUploadError) {
+      console.error('Optimized upload failed:', optUploadError.message);
+      // Non-fatal: keep original, mark as failed
+      optimizedStoragePath = null;
+      optResult = { ...optResult, status: 'failed' as const, optimizedBuffer: null };
+    } else {
+      optimizedSize = optResult.optimizedBuffer.length;
+    }
+  }
+
+  // 7. Insert metadata into Supabase Postgres
+  const { data: record, error: dbError } = await supabase
+    .from('files')
+    .insert({
+      id: uuid,
+      original_filename: originalFilename,
+      mime_type: file.type,
+      original_size: file.size,
+      optimized_size: optimizedSize,
+      compression_method: optResult.compressionMethod,
+      upload_date: new Date().toISOString(),
+      original_storage_path: originalStoragePath,
+      optimized_storage_path: optimizedStoragePath,
+      optimization_status: optResult.status,
+    })
+    .select()
+    .single();
+
+  if (dbError) {
+    // Clean up storage on DB failure
+    await supabase.storage.from(ORIGINALS_BUCKET).remove([originalStoragePath]);
+    if (optimizedStoragePath) await supabase.storage.from(OPTIMIZED_BUCKET).remove([optimizedStoragePath]);
+    return err('Database insert failed', dbError.message, 500);
+  }
+
+  return NextResponse.json({ success: true, file: record }, { status: 201 });
 }
 
-export const maxDuration = 60; // seconds
+export const maxDuration = 60;

@@ -1,4 +1,4 @@
-import { formatBytes, getSavingsPercent, getCategory, mimeToExt } from '@/lib/storage';
+import { formatBytes, getSavingsPercent, getCategory, mimeToExt, extToMime } from '@/lib/storage';
 
 describe('formatBytes', () => {
   it('formats 0 bytes', () => expect(formatBytes(0)).toBe('0 B'));
@@ -30,4 +30,11 @@ describe('mimeToExt', () => {
   it('maps image/jpeg to .jpg', () => expect(mimeToExt('image/jpeg')).toBe('.jpg'));
   it('maps video/mp4 to .mp4', () => expect(mimeToExt('video/mp4')).toBe('.mp4'));
   it('returns empty string for unknown', () => expect(mimeToExt('application/octet-stream')).toBe(''));
+});
+
+describe('extToMime', () => {
+  it('maps .webp to image/webp', () => expect(extToMime('.webp')).toBe('image/webp'));
+  it('maps .gz to application/gzip', () => expect(extToMime('.gz')).toBe('application/gzip'));
+  it('maps .mp3 to audio/mpeg', () => expect(extToMime('.mp3')).toBe('audio/mpeg'));
+  it('falls back to octet-stream', () => expect(extToMime('.xyz')).toBe('application/octet-stream'));
 });

@@ -1,53 +1,45 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
-import type { FileRecord } from '@/types';
+import { supabase } from '@/lib/supabase';
 
 export async function GET(request: NextRequest) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const category = searchParams.get('category') || 'all';
-    const search = searchParams.get('search') || '';
+  const { searchParams } = new URL(request.url);
+  const category = searchParams.get('category') || 'all';
+  const search = searchParams.get('search') || '';
 
-    const db = getDb();
+  let query = supabase.from('files').select('*').order('upload_date', { ascending: false });
 
-    let query = `
-      SELECT *,
-        CASE
-          WHEN optimized_size IS NOT NULL AND original_size > 0
-          THEN ROUND((CAST(original_size - optimized_size AS REAL) / original_size) * 100, 1)
-          ELSE NULL
-        END AS savings_percent
-      FROM files
-      WHERE 1=1
-    `;
-    const params: (string | number)[] = [];
-
-    if (search) {
-      query += ` AND original_filename LIKE ?`;
-      params.push(`%${search}%`);
-    }
-
-    if (category === 'images') {
-      query += ` AND mime_type LIKE 'image/%'`;
-    } else if (category === 'pdfs') {
-      query += ` AND mime_type = 'application/pdf'`;
-    } else if (category === 'audio') {
-      query += ` AND mime_type LIKE 'audio/%'`;
-    } else if (category === 'video') {
-      query += ` AND mime_type LIKE 'video/%'`;
-    } else if (category === 'documents') {
-      query += ` AND (mime_type LIKE 'text/%' OR mime_type IN ('application/json','application/csv','application/xml'))`;
-    } else if (category === 'no_savings') {
-      query += ` AND optimization_status IN ('no_savings', 'unsupported', 'failed')`;
-    }
-
-    query += ` ORDER BY upload_date DESC`;
-
-    const files = db.prepare(query).all(...params) as (FileRecord & { savings_percent: number | null })[];
-
-    return NextResponse.json({ files, total: files.length });
-  } catch (err) {
-    console.error('List files error:', err);
-    return NextResponse.json({ error: 'Failed to list files' }, { status: 500 });
+  if (search) {
+    query = query.ilike('original_filename', `%${search}%`);
   }
+
+  if (category === 'images') {
+    query = query.like('mime_type', 'image/%');
+  } else if (category === 'pdfs') {
+    query = query.eq('mime_type', 'application/pdf');
+  } else if (category === 'audio') {
+    query = query.like('mime_type', 'audio/%');
+  } else if (category === 'video') {
+    query = query.like('mime_type', 'video/%');
+  } else if (category === 'documents') {
+    query = query.or('mime_type.like.text/%,mime_type.eq.application/json,mime_type.eq.application/csv,mime_type.eq.application/xml');
+  } else if (category === 'no_savings') {
+    query = query.in('optimization_status', ['no_savings', 'unsupported', 'failed']);
+  }
+
+  const { data: files, error } = await query;
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  // Compute savings_percent in JS (Supabase doesn't do computed columns easily)
+  const filesWithSavings = (files ?? []).map(f => ({
+    ...f,
+    savings_percent:
+      f.optimized_size != null && f.original_size > 0
+        ? Math.round(((f.original_size - f.optimized_size) / f.original_size) * 1000) / 10
+        : null,
+  }));
+
+  return NextResponse.json({ files: filesWithSavings, total: filesWithSavings.length });
 }

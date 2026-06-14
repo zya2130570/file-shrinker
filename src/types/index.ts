@@ -14,8 +14,8 @@ export interface FileRecord {
   optimized_size: number | null;
   compression_method: string | null;
   upload_date: string;
-  original_path: string;
-  optimized_path: string | null;
+  original_storage_path: string;   // path within fsa-originals bucket
+  optimized_storage_path: string | null; // path within fsa-optimized bucket
   optimization_status: OptimizationStatus;
   user_id: string | null;
 }
@@ -30,6 +30,7 @@ export interface UploadResponse {
   success: boolean;
   file?: FileRecord;
   error?: string;
+  detail?: string;
 }
 
 export interface ListFilesResponse {
@@ -37,9 +38,10 @@ export interface ListFilesResponse {
   total: number;
 }
 
+// Processors now return a buffer (no local disk I/O in serverless)
 export interface ProcessorResult {
-  optimizedPath: string | null;
-  optimizedSize: number | null;
+  optimizedBuffer: Buffer | null;
+  optimizedExt: string | null;   // e.g. '.webp', '.gz'
   compressionMethod: string | null;
   status: OptimizationStatus;
 }

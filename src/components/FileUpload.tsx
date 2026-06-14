@@ -7,9 +7,8 @@ import type { FileRecord } from '@/types';
 interface UploadState {
   file: File;
   progress: number;
-  status: 'uploading' | 'done' | 'error';
+  status: 'uploading' | 'processing' | 'done' | 'error';
   error?: string;
-  result?: FileRecord;
 }
 
 interface FileUploadProps {
@@ -23,85 +22,90 @@ const ACCEPTED_TYPES = [
   'application/zip', 'application/gzip', 'application/x-7z-compressed',
 ].join(',');
 
+function setUploadField(
+  setUploads: React.Dispatch<React.SetStateAction<UploadState[]>>,
+  file: File,
+  patch: Partial<UploadState>
+) {
+  setUploads(prev => prev.map(u => u.file === file ? { ...u, ...patch } : u));
+}
+
 export default function FileUpload({ onUploadComplete }: FileUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [uploads, setUploads] = useState<UploadState[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const uploadFile = useCallback(async (file: File) => {
-    const id = `${file.name}-${Date.now()}`;
-
     setUploads(prev => [...prev, { file, progress: 0, status: 'uploading' }]);
-
-    const formData = new FormData();
-    formData.append('file', file);
+    const set = (patch: Partial<UploadState>) => setUploadField(setUploads, file, patch);
 
     try {
-      const xhr = new XMLHttpRequest();
+      // ── Step 1: Validate & get a direct Supabase Storage upload URL ──────────
+      // Only sends JSON metadata — no file bytes go through Vercel here.
+      const prepRes = await fetch('/api/upload/prepare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, mimeType: file.type, size: file.size }),
+      });
+      const prep = await prepRes.json();
+      if (!prepRes.ok) {
+        set({ status: 'error', error: `HTTP ${prepRes.status}: ${prep.error ?? 'Prepare failed'}` });
+        return;
+      }
+      const { uuid, storagePath, originalFilename, uploadUrl, uploadToken } = prep as {
+        uuid: string; storagePath: string; originalFilename: string;
+        uploadUrl: string; uploadToken: string;
+      };
 
-      const progressPromise = new Promise<void>((resolve) => {
+      // ── Step 2: Upload file DIRECTLY to Supabase Storage via XHR ─────────────
+      // The File (Blob) goes straight from the browser to Supabase — never touches
+      // Vercel's function, so there is no 4.5 MB function payload limit, and the
+      // native Blob serialisation keeps binary bytes intact (no ByteString issue).
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
         xhr.upload.addEventListener('progress', (e) => {
           if (e.lengthComputable) {
-            const pct = Math.round((e.loaded / e.total) * 90);
-            setUploads(prev =>
-              prev.map(u => u.file === file ? { ...u, progress: pct } : u)
-            );
+            set({ progress: Math.round((e.loaded / e.total) * 85) });
           }
         });
-        xhr.addEventListener('loadend', () => resolve());
+        xhr.addEventListener('loadend', () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve();
+          } else {
+            const body = xhr.responseText.slice(0, 300);
+            reject(new Error(`Supabase Storage returned HTTP ${xhr.status}: ${body}`));
+          }
+        });
+        xhr.addEventListener('error', () => reject(new Error('Network error during upload to storage')));
+
+        xhr.open('POST', uploadUrl);
+        xhr.setRequestHeader('Authorization', `Bearer ${uploadToken}`);
+        xhr.setRequestHeader('Content-Type', file.type);
+        xhr.setRequestHeader('x-upsert', 'false');
+        xhr.send(file); // Native File/Blob — binary-safe
       });
 
-      xhr.open('POST', '/api/upload');
-      xhr.send(formData);
-      await progressPromise;
+      set({ progress: 90, status: 'processing' });
 
-      // XHR status 0 means the request never got a response (connection refused,
-      // CORS block, or the server closed the connection without a reply).
-      if (xhr.status === 0) {
-        const detail = file.size > 4.5 * 1024 * 1024
-          ? `No response from server. File size is ${(file.size / 1024 / 1024).toFixed(1)} MB — your hosting plan may have a smaller upload limit.`
-          : 'No response from server. Check your network connection or server logs.';
-        setUploads(prev =>
-          prev.map(u => u.file === file ? { ...u, status: 'error', error: detail } : u)
-        );
+      // ── Step 3: Trigger optimization + DB registration ────────────────────────
+      // Only JSON in the body — Vercel function gets ~100 bytes, not the whole file.
+      const completeRes = await fetch('/api/upload/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uuid, storagePath, originalFilename, mimeType: file.type, size: file.size }),
+      });
+      const complete = await completeRes.json();
+      if (!completeRes.ok || !complete.success) {
+        set({ status: 'error', error: `HTTP ${completeRes.status}: ${complete.error ?? 'Completion failed'}${complete.detail ? ` (${complete.detail})` : ''}` });
         return;
       }
 
-      let response: { success?: boolean; error?: string; detail?: string } = {};
-      try {
-        response = JSON.parse(xhr.responseText);
-      } catch {
-        // Response body wasn't valid JSON — show the raw text (truncated)
-        const rawPreview = xhr.responseText.slice(0, 200);
-        setUploads(prev =>
-          prev.map(u => u.file === file
-            ? { ...u, status: 'error', error: `Server returned HTTP ${xhr.status} with non-JSON body: ${rawPreview}` }
-            : u)
-        );
-        return;
-      }
+      set({ progress: 100, status: 'done' });
+      onUploadComplete(complete.file as FileRecord);
 
-      if (xhr.status >= 200 && xhr.status < 300 && response.success) {
-        setUploads(prev =>
-          prev.map(u => u.file === file ? { ...u, progress: 100, status: 'done', result: (response as { file?: import('@/types').FileRecord }).file } : u)
-        );
-        onUploadComplete((response as { file: import('@/types').FileRecord }).file);
-      } else {
-        // Show both the short error and the server detail if present
-        const msg = [
-          `HTTP ${xhr.status}:`,
-          response.error ?? 'Upload failed',
-          response.detail ? `(${response.detail})` : '',
-        ].filter(Boolean).join(' ');
-        setUploads(prev =>
-          prev.map(u => u.file === file ? { ...u, status: 'error', error: msg } : u)
-        );
-      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setUploads(prev =>
-        prev.map(u => u.file === file ? { ...u, status: 'error', error: `Client error: ${msg}` } : u)
-      );
+      set({ status: 'error', error: msg });
     }
   }, [onUploadComplete]);
 
@@ -161,7 +165,7 @@ export default function FileUpload({ onUploadComplete }: FileUploadProps) {
                 <p className="text-sm font-medium truncate text-gray-800 dark:text-gray-200">
                   {upload.file.name}
                 </p>
-                {upload.status === 'uploading' && (
+                {(upload.status === 'uploading' || upload.status === 'processing') && (
                   <div className="mt-1.5">
                     <div className="h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                       <div
@@ -169,18 +173,22 @@ export default function FileUpload({ onUploadComplete }: FileUploadProps) {
                         style={{ width: `${upload.progress}%` }}
                       />
                     </div>
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{upload.progress}%</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                      {upload.status === 'processing' ? 'Optimizing…' : `${upload.progress}%`}
+                    </p>
                   </div>
                 )}
                 {upload.status === 'error' && (
-                  <p className="text-xs text-red-500 mt-0.5">{upload.error}</p>
+                  <p className="text-xs text-red-500 mt-0.5 break-all">{upload.error}</p>
                 )}
                 {upload.status === 'done' && (
                   <p className="text-xs text-green-600 dark:text-green-400 mt-0.5">Uploaded successfully</p>
                 )}
               </div>
               <div className="shrink-0">
-                {upload.status === 'uploading' && <Loader2 className="animate-spin text-blue-500" size={18} />}
+                {(upload.status === 'uploading' || upload.status === 'processing') && (
+                  <Loader2 className="animate-spin text-blue-500" size={18} />
+                )}
                 {upload.status === 'done' && <CheckCircle className="text-green-500" size={18} />}
                 {upload.status === 'error' && <AlertCircle className="text-red-500" size={18} />}
               </div>

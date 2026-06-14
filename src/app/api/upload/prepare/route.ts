@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
-import { supabase } from '@/lib/supabase';
 import { ORIGINALS_BUCKET, mimeToExt } from '@/lib/storage';
 
 const MAX_FILE_SIZE = 500 * 1024 * 1024;
@@ -47,24 +46,48 @@ export async function POST(request: NextRequest) {
   const storagePath = `${uuid}${ext}`;
   const originalFilename = path.basename(filename).replace(/[^\w.\- ]/g, '_').slice(0, 255);
 
-  // Generate a signed upload URL (valid for 2 hours).
-  // Token is in the URL — client only needs Content-Type header, no Authorization.
-  const { data: signed, error: signErr } = await supabase.storage
-    .from(ORIGINALS_BUCKET)
-    .createSignedUploadUrl(storagePath);
+  // Generate a signed upload URL directly via the REST API.
+  // Using raw fetch instead of the JS client so we get the actual error body on failure.
+  const supabaseUrl = process.env.SUPABASE_URL!.replace(/\/$/, '');
+  const supabaseKey = process.env.SUPABASE_ANON_KEY!.trim();
 
-  if (signErr || !signed?.signedUrl) {
+  const signRes = await fetch(
+    `${supabaseUrl}/storage/v1/object/upload/sign/${ORIGINALS_BUCKET}/${storagePath}`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+
+  if (!signRes.ok) {
+    const errText = await signRes.text().catch(() => '(no body)');
     return NextResponse.json(
-      { error: 'Failed to create upload URL', detail: signErr?.message ?? 'No signed URL returned' },
+      { error: 'Failed to create upload URL', detail: `Storage API HTTP ${signRes.status}: ${errText}` },
       { status: 500 }
     );
   }
+
+  const signJson = await signRes.json() as { url?: string; signedURL?: string; error?: string };
+  const signedPath = signJson.url ?? signJson.signedURL;
+  if (!signedPath) {
+    return NextResponse.json(
+      { error: 'Failed to create upload URL', detail: `Unexpected response: ${JSON.stringify(signJson)}` },
+      { status: 500 }
+    );
+  }
+
+  // signedPath is relative (e.g. "/object/upload/sign/...?token=...") or absolute
+  const uploadUrl = signedPath.startsWith('http')
+    ? signedPath
+    : `${supabaseUrl}/storage/v1${signedPath.startsWith('/') ? signedPath : `/${signedPath}`}`;
 
   return NextResponse.json({
     uuid,
     storagePath,
     originalFilename,
-    // Client PUTs the file directly to this URL — no auth header needed
-    uploadUrl: signed.signedUrl,
+    uploadUrl,
   });
 }

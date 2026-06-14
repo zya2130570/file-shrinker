@@ -49,7 +49,8 @@ export default function FileUpload({ onUploadComplete }: FileUploadProps) {
       });
       const prep = await prepRes.json();
       if (!prepRes.ok) {
-        set({ status: 'error', error: `HTTP ${prepRes.status}: ${prep.error ?? 'Prepare failed'}` });
+        const detail = prep.detail ? ` — ${prep.detail}` : '';
+        set({ status: 'error', error: `HTTP ${prepRes.status}: ${prep.error ?? 'Prepare failed'}${detail}` });
         return;
       }
       const { uuid, storagePath, originalFilename, uploadUrl } = prep as {

@@ -15,9 +15,22 @@ const ALLOWED_MIME_TYPES = new Set([
   'application/zip', 'application/x-zip-compressed', 'application/gzip', 'application/x-7z-compressed',
 ]);
 
-// Step 1 of 3: validate the file and return a Supabase-signed upload URL.
-// The token is embedded in the URL query string — the client sends NO
-// Authorization header, avoiding the XHR ISO-8859-1 header restriction entirely.
+function cleanUrl(value: string | undefined): string | null {
+  if (!value) return null;
+  const match = value.trim().match(/https:\/\/[a-z0-9-]+\.supabase\.co/i);
+  if (!match) return null;
+  return match[0].replace(/\/$/, '');
+}
+
+function cleanKey(value: string | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  const jwt = trimmed.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/)?.[0];
+  if (jwt) return jwt;
+  if (/^[\x21-\x7E]+$/.test(trimmed)) return trimmed;
+  return null;
+}
+
 export async function POST(request: NextRequest) {
   try {
     let body: { filename?: string; mimeType?: string; size?: number };
@@ -42,11 +55,14 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_ANON_KEY;
-    if (!supabaseUrl || !supabaseKey) {
+    const baseUrl = cleanUrl(process.env.SUPABASE_URL);
+    const supabaseKey = cleanKey(process.env.SUPABASE_ANON_KEY);
+    if (!baseUrl || !supabaseKey) {
       return NextResponse.json(
-        { error: 'Server misconfiguration', detail: 'Missing SUPABASE_URL or SUPABASE_ANON_KEY' },
+        {
+          error: 'Supabase configuration is invalid',
+          detail: 'In Vercel, paste only the raw SUPABASE_URL and SUPABASE_ANON_KEY values. Remove labels, arrows, quotes, or notes.',
+        },
         { status: 500 }
       );
     }
@@ -56,9 +72,6 @@ export async function POST(request: NextRequest) {
     const storagePath = `${uuid}${ext}`;
     const originalFilename = path.basename(filename).replace(/[^\w.\- ]/g, '_').slice(0, 255);
 
-    const baseUrl = supabaseUrl.replace(/\/$/, '');
-
-    // Call the Supabase Storage REST API directly so any error body is visible.
     let signRes: Response;
     try {
       signRes = await fetch(
@@ -66,9 +79,12 @@ export async function POST(request: NextRequest) {
         {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${supabaseKey.trim()}`,
+            apikey: supabaseKey,
+            Authorization: `Bearer ${supabaseKey}`,
             'Content-Type': 'application/json',
           },
+          body: '{}',
+          cache: 'no-store',
         }
       );
     } catch (fetchErr) {
@@ -95,13 +111,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // signedPath is relative like "/object/upload/sign/...?token=..." — prepend base
     const uploadUrl = signedPath.startsWith('http')
       ? signedPath
       : `${baseUrl}/storage/v1${signedPath.startsWith('/') ? signedPath : `/${signedPath}`}`;
 
     return NextResponse.json({ uuid, storagePath, originalFilename, uploadUrl });
-
   } catch (err) {
     return NextResponse.json(
       { error: 'Unexpected server error', detail: String(err) },

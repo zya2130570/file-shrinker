@@ -2,6 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { ORIGINALS_BUCKET, OPTIMIZED_BUCKET } from '@/lib/storage';
 import { processBuffer } from '@/lib/processors';
+import {
+  compressPdfWithILoveApi,
+  isILoveApiConfigured,
+  type ILoveApiCreditUpdate,
+} from '@/lib/iloveapi';
 
 const OPTIMIZABLE_TYPES = new Set([
   'image/jpeg', 'image/png', 'image/gif', 'image/tiff', 'image/bmp', 'image/webp',
@@ -9,9 +14,6 @@ const OPTIMIZABLE_TYPES = new Set([
   'text/html', 'text/xml', 'application/xml', 'text/javascript', 'application/javascript', 'text/css',
 ]);
 
-// Step 3 of 3: called after the browser finishes the direct Supabase Storage upload.
-// Receives JSON metadata only — no file bytes come through Vercel.
-// Downloads the stored file (for optimizable types), runs optimization, and inserts the DB record.
 export async function POST(request: NextRequest) {
   let body: {
     uuid?: string; storagePath?: string; originalFilename?: string;
@@ -28,50 +30,82 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ success: false, error: 'Missing required fields' }, { status: 400 });
   }
 
-  // Optimization: download from storage, process in memory, re-upload
   let optimizedStoragePath: string | null = null;
   let optimizedSize: number | null = null;
   let optStatus: string = 'unsupported';
   let compressionMethod: string | null = null;
+  let creditUpdate: ILoveApiCreditUpdate | null = null;
 
-  if (OPTIMIZABLE_TYPES.has(mimeType)) {
-    try {
-      const { data: blob, error: dlErr } = await supabase.storage.from(ORIGINALS_BUCKET).download(storagePath);
-      if (dlErr || !blob) throw new Error(dlErr?.message ?? 'Download returned empty');
+  try {
+    const { data: blob, error: dlErr } = await supabase.storage.from(ORIGINALS_BUCKET).download(storagePath);
+    if (dlErr || !blob) throw new Error(dlErr?.message ?? 'Download returned empty');
 
-      const buffer = Buffer.from(await blob.arrayBuffer());
-      const result = await processBuffer(buffer, mimeType);
+    const buffer = Buffer.from(await blob.arrayBuffer());
+    let optimizedBuffer: Buffer | null = null;
+    let optimizedExt: string | null = null;
+    let optimizedMime: string | null = null;
 
-      optStatus = result.status;
-      compressionMethod = result.compressionMethod;
-
-      if (result.optimizedBuffer && result.optimizedExt) {
-        const optPath = `${uuid}${result.optimizedExt}`;
-        const optMime = result.optimizedExt === '.gz' ? 'application/gzip' : 'image/webp';
-
-        // Wrap in Uint8Array to satisfy BlobPart typing (Buffer's ArrayBufferLike
-        // doesn't narrow to ArrayBuffer in strict mode)
-        const optBlob = new Blob([new Uint8Array(result.optimizedBuffer)], { type: optMime });
-        const { error: upErr } = await supabase.storage.from(OPTIMIZED_BUCKET).upload(optPath, optBlob, {
-          contentType: optMime,
-          upsert: false,
-        });
-
-        if (upErr) {
-          console.error('Optimized upload failed:', upErr.message);
-          optStatus = 'failed';
-        } else {
-          optimizedStoragePath = optPath;
-          optimizedSize = result.optimizedBuffer.length;
-        }
+    if (mimeType === 'application/pdf') {
+      if (!isILoveApiConfigured()) {
+        optStatus = 'unsupported';
+        compressionMethod = 'PDF compression not enabled — connect iLoveAPI';
+      } else {
+        const result = await compressPdfWithILoveApi(
+          buffer,
+          originalFilename ?? 'document.pdf',
+          'recommended'
+        );
+        creditUpdate = result.credits;
+        optimizedBuffer = result.buffer;
+        optimizedExt = '.pdf';
+        optimizedMime = 'application/pdf';
+        compressionMethod = 'iLoveAPI PDF compression (recommended)';
+        optStatus = result.buffer.length < buffer.length ? 'optimized' : 'no_savings';
       }
-    } catch (err) {
-      console.error('Optimization pipeline error:', err);
-      optStatus = 'failed';
+    } else if (OPTIMIZABLE_TYPES.has(mimeType)) {
+      const result = await processBuffer(buffer, mimeType);
+      optimizedBuffer = result.optimizedBuffer;
+      optimizedExt = result.optimizedExt;
+      compressionMethod = result.compressionMethod;
+      optStatus = result.status;
+      optimizedMime = result.optimizedExt === '.gz' ? 'application/gzip' : 'image/webp';
+    } else if (mimeType.startsWith('audio/')) {
+      optStatus = 'unsupported';
+      compressionMethod = 'Audio compression requires FFmpeg or a media-processing service';
+    } else if (mimeType.startsWith('video/')) {
+      optStatus = 'unsupported';
+      compressionMethod = 'Video compression requires FFmpeg or a media-processing service';
+    } else {
+      optStatus = 'unsupported';
+      compressionMethod = 'This format is not currently compressible in FileShrinker';
     }
+
+    if (optimizedBuffer && optimizedExt && optimizedMime && optimizedBuffer.length < buffer.length) {
+      const optPath = `${uuid}${optimizedExt}`;
+      const optBlob = new Blob([new Uint8Array(optimizedBuffer)], { type: optimizedMime });
+      const { error: upErr } = await supabase.storage.from(OPTIMIZED_BUCKET).upload(optPath, optBlob, {
+        contentType: optimizedMime,
+        upsert: false,
+      });
+
+      if (upErr) {
+        console.error('Optimized upload failed:', upErr.message);
+        optStatus = 'failed';
+        compressionMethod = 'Compression succeeded, but saving the optimized copy failed';
+      } else {
+        optimizedStoragePath = optPath;
+        optimizedSize = optimizedBuffer.length;
+        optStatus = 'optimized';
+      }
+    }
+  } catch (err) {
+    console.error('Optimization pipeline error:', err);
+    optStatus = 'failed';
+    compressionMethod = mimeType === 'application/pdf'
+      ? 'iLoveAPI PDF compression failed — original file kept'
+      : 'Optimization failed — original file kept';
   }
 
-  // Insert metadata record
   const { data: record, error: dbError } = await supabase
     .from('files')
     .insert({
@@ -90,7 +124,6 @@ export async function POST(request: NextRequest) {
     .single();
 
   if (dbError) {
-    // Clean up storage on DB failure (best-effort)
     await supabase.storage.from(ORIGINALS_BUCKET).remove([storagePath]);
     if (optimizedStoragePath) await supabase.storage.from(OPTIMIZED_BUCKET).remove([optimizedStoragePath]);
     return NextResponse.json({ success: false, error: 'Database insert failed', detail: dbError.message }, { status: 500 });
@@ -101,7 +134,11 @@ export async function POST(request: NextRequest) {
       ? Math.round(((record.original_size - record.optimized_size) / record.original_size) * 1000) / 10
       : null;
 
-  return NextResponse.json({ success: true, file: { ...record, savings_percent } }, { status: 201 });
+  return NextResponse.json({
+    success: true,
+    file: { ...record, savings_percent },
+    credit_update: creditUpdate,
+  }, { status: 201 });
 }
 
 export const maxDuration = 60;

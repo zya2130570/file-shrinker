@@ -10,8 +10,28 @@ import {
 
 const OPTIMIZABLE_TYPES = new Set([
   'image/jpeg', 'image/png', 'image/gif', 'image/tiff', 'image/bmp', 'image/webp',
-  'text/plain', 'text/csv', 'application/json', 'application/csv',
+  'text/plain', 'text/csv', 'text/markdown', 'application/json', 'application/csv',
   'text/html', 'text/xml', 'application/xml', 'text/javascript', 'application/javascript', 'text/css',
+]);
+
+const OFFICE_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/msword',
+  'application/vnd.ms-excel',
+  'application/vnd.ms-powerpoint',
+  'application/rtf',
+  'text/rtf',
+]);
+
+const ARCHIVE_TYPES = new Set([
+  'application/zip',
+  'application/gzip',
+  'application/x-gzip',
+  'application/x-7z-compressed',
+  'application/vnd.rar',
+  'application/x-rar-compressed',
 ]);
 
 export async function POST(request: NextRequest) {
@@ -48,7 +68,7 @@ export async function POST(request: NextRequest) {
     if (mimeType === 'application/pdf') {
       if (!isILoveApiConfigured()) {
         optStatus = 'unsupported';
-        compressionMethod = 'PDF compression not enabled — connect iLoveAPI';
+        compressionMethod = 'PDF saved as the original only. Connect iLoveAPI to enable PDF compression.';
       } else {
         const result = await compressPdfWithILoveApi(
           buffer,
@@ -62,22 +82,28 @@ export async function POST(request: NextRequest) {
         compressionMethod = 'iLoveAPI PDF compression (recommended)';
         optStatus = result.buffer.length < buffer.length ? 'optimized' : 'no_savings';
       }
-    } else if (OPTIMIZABLE_TYPES.has(mimeType)) {
+    } else if (OPTIMIZABLE_TYPES.has(mimeType) || mimeType.startsWith('text/')) {
       const result = await processBuffer(buffer, mimeType);
       optimizedBuffer = result.optimizedBuffer;
       optimizedExt = result.optimizedExt;
       compressionMethod = result.compressionMethod;
       optStatus = result.status;
       optimizedMime = result.optimizedExt === '.gz' ? 'application/gzip' : 'image/webp';
+    } else if (OFFICE_TYPES.has(mimeType)) {
+      optStatus = 'unsupported';
+      compressionMethod = 'Saved as the original only. Office files are already compressed internally, so recompressing them usually provides little or no benefit.';
+    } else if (ARCHIVE_TYPES.has(mimeType)) {
+      optStatus = 'unsupported';
+      compressionMethod = 'Saved as the original only. This is already a compressed archive, so another compression pass would usually not make it meaningfully smaller.';
     } else if (mimeType.startsWith('audio/')) {
       optStatus = 'unsupported';
-      compressionMethod = 'Audio compression requires FFmpeg or a media-processing service';
+      compressionMethod = 'Saved as the original only. Audio compression is not enabled in this version.';
     } else if (mimeType.startsWith('video/')) {
       optStatus = 'unsupported';
-      compressionMethod = 'Video compression requires FFmpeg or a media-processing service';
+      compressionMethod = 'Saved as the original only. Video compression is not enabled in this version.';
     } else {
       optStatus = 'unsupported';
-      compressionMethod = 'This format is not currently compressible in FileShrinker';
+      compressionMethod = 'Saved as the original only. FileShrinker does not currently have a safe, useful compressor for this format.';
     }
 
     if (optimizedBuffer && optimizedExt && optimizedMime && optimizedBuffer.length < buffer.length) {
@@ -102,8 +128,8 @@ export async function POST(request: NextRequest) {
     console.error('Optimization pipeline error:', err);
     optStatus = 'failed';
     compressionMethod = mimeType === 'application/pdf'
-      ? 'iLoveAPI PDF compression failed — original file kept'
-      : 'Optimization failed — original file kept';
+      ? 'iLoveAPI PDF compression failed. The original file was kept.'
+      : 'Optimization failed. The original file was kept.';
   }
 
   const { data: record, error: dbError } = await supabase

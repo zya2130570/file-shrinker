@@ -36,7 +36,8 @@ function getClient(): SupabaseClient<any, any, any> {
     );
   }
 
-  _client = createClient(url, key, { db: { schema: 'file_shrinker' } });
+  // FileShrinker stores metadata in the default public schema.
+  _client = createClient(url, key, { db: { schema: 'public' } });
   return _client;
 }
 

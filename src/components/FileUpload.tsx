@@ -47,15 +47,19 @@ export default function FileUpload({ onUploadComplete }: FileUploadProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filename: file.name, mimeType: file.type, size: file.size }),
       });
-      const prep = await prepRes.json();
+      let prep: { error?: string; detail?: string; uuid?: string; storagePath?: string; originalFilename?: string; uploadUrl?: string };
+      try {
+        prep = await prepRes.json();
+      } catch {
+        set({ status: 'error', error: `HTTP ${prepRes.status}: Server returned non-JSON (check Vercel logs)` });
+        return;
+      }
       if (!prepRes.ok) {
         const detail = prep.detail ? ` — ${prep.detail}` : '';
         set({ status: 'error', error: `HTTP ${prepRes.status}: ${prep.error ?? 'Prepare failed'}${detail}` });
         return;
       }
-      const { uuid, storagePath, originalFilename, uploadUrl } = prep as {
-        uuid: string; storagePath: string; originalFilename: string; uploadUrl: string;
-      };
+      const { uuid, storagePath, originalFilename, uploadUrl } = prep as Required<typeof prep>;
 
       // ── Step 2: Upload file DIRECTLY to Supabase Storage via XHR ─────────────
       // The File (Blob) goes straight from the browser to Supabase — never touches
